@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqlite-query-plan-diff"
-version = "0.1.0"
+version = "1.0.0"
 description = "SQLite EXPLAIN QUERY PLAN snapshot capture and regression checker for CI"
 readme = "README.md"
 requires-python = ">=3.11"

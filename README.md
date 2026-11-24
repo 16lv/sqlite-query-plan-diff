@@ -1,17 +1,18 @@
 # sqlite-query-plan-diff
 
-SQLite `EXPLAIN QUERY PLAN` baseline capture and index-regression checker built with **Python 3.12** standard-library `sqlite3`.
+SQLite `EXPLAIN QUERY PLAN` baseline capture, query-strategy inspection (`explain`), and index-regression checker built with **Python 3.12** standard-library `sqlite3`.
 
 ## Overview
 
-`sqlite-query-plan-diff` records query-planner strategies (`COVERING_INDEX`, `INDEX_SEARCH`, `FULL_SCAN`, `TEMP B-TREE`) for named parameterised SQL queries as JSON snapshots, then compares updated schemas in CI to fail builds cleanly whenever an index migration drops back to a table scan.
+`sqlite-query-plan-diff` records SQLite query-planner strategies (`COVERING_INDEX`, `INDEX_SEARCH`, `FULL_SCAN`, `TEMP B-TREE`) for named parameterised queries from `.sql` or `.json` files, then checks updated schemas or database files in CI to fail builds cleanly whenever an index migration regresses to a table scan.
 
 ## Features
 
 - **Zero runtime dependencies**: Built purely on Python 3.12 standard-library `sqlite3`, `json`, `argparse`, and `dataclasses`.
-- **Plan classification & diffing**: Distinguishes covering indexes from secondary table lookups, catches `INDEX -> FULL_SCAN` and `COVERING_INDEX -> INDEX_SEARCH` regressions, and flags missing baseline queries.
-- **Optional temp B-tree check**: Pass `--strict-temp-btree` when an `ORDER BY` or `GROUP BY` change introduces an unindexed temporary sort.
-- **CI exit codes & JSON output**: Returns exit code `0` cleanly when plans hold and `1` on regressions.
+- **Annotated `.sql` & `.json` inputs**: Supports `-- name: <query_id>` and optional `-- params: [...]` comments inside standard `.sql` files alongside structured `.json` arrays.
+- **Accurate scan vs index classification**: Distinguishes `SCAN ... USING COVERING INDEX` from unindexed `SCAN table` operations (including multi-table join steps where any unindexed scan flags `FULL_SCAN`).
+- **Safe read-only database inspection**: Opens existing SQLite database files via URI `?mode=ro` when `--schema` is omitted, failing cleanly rather than creating empty files on typos.
+- **`explain`, `capture`, and `check` subcommands**: Inspect live query plans interactively (`--format text` or `--format json`), capture JSON baselines, and enforce strict exit codes (`0` pass, `1` regression, `2` input/SQL error) with optional `--strict-temp-btree`.
 
 ## Technology Stack
 
@@ -27,16 +28,43 @@ pip install -e ".[dev]"
 
 ## Usage Examples
 
-Capture a baseline against a schema file:
+Inspect plans directly from an annotated `.sql` file against a schema:
 
-```bash
-sqlite-plan-diff capture :memory: queries.json --schema schema.sql -o baseline.json
+```sql
+-- queries.sql
+-- name: lookup_by_email
+-- params: ["alice@example.org"]
+SELECT id FROM students WHERE email = ?;
 ```
 
-Verify a new migration against the saved baseline:
+```bash
+sqlite-plan-diff explain :memory: queries.sql --schema schema.sql
+```
+
+Capture a JSON baseline:
 
 ```bash
-sqlite-plan-diff check :memory: queries.json --schema updated_schema.sql --baseline baseline.json --strict-temp-btree
+sqlite-plan-diff capture :memory: queries.sql --schema schema.sql -o baseline.json
+```
+
+Verify an updated schema against the saved baseline (`--format text` or `json`):
+
+```bash
+sqlite-plan-diff check :memory: queries.sql --schema updated_schema.sql --baseline baseline.json --strict-temp-btree
+```
+
+## Project Structure
+
+```text
+sqlite-query-plan-diff/
+├── src/sqlite_plan_diff/
+│   ├── __init__.py
+│   ├── __main__.py
+│   └── checker.py
+├── tests/
+│   └── test_checker.py
+├── pyproject.toml
+└── requirements.txt
 ```
 
 ## Testing
@@ -44,9 +72,10 @@ sqlite-plan-diff check :memory: queries.json --schema updated_schema.sql --basel
 ```bash
 ruff check .
 pytest -v
+sqlite-plan-diff --help
 ```
 
 ## Known Limitations & Future Improvements
 
-- Built specifically for SQLite's `EXPLAIN QUERY PLAN` detail strings rather than PostgreSQL `EXPLAIN (FORMAT JSON)`.
-- Adding an annotated `.sql` file parser (`-- name: lookup_user`) alongside JSON query lists would reduce boilerplate in larger SQL repositories.
+- Targets SQLite's `EXPLAIN QUERY PLAN` output rather than PostgreSQL `EXPLAIN (FORMAT JSON)`.
+- Parameter lists match positional `?` bindings sequentially per query; supporting `:named` parameter objects alongside positional arrays is a natural next extension.

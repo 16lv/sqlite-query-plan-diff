@@ -10,7 +10,10 @@ from sqlite_plan_diff import (
     PlanSnapshot,
     QuerySpec,
     capture_snapshots,
+    classify_access_kind,
     diff_snapshots,
+    load_query_specs,
+    parse_sql_queries,
 )
 from sqlite_plan_diff.checker import main
 
@@ -57,6 +60,28 @@ def test_capture_classifies_covering_index_vs_full_scan(tmp_path: Path) -> None:
     assert bad_snaps[0].access_kind == "FULL_SCAN"
 
 
+def test_classify_handles_covering_index_scan_and_mixed_join_scans() -> None:
+    assert (
+        classify_access_kind(["SCAN events USING COVERING INDEX idx_events_created"])
+        == "COVERING_INDEX"
+    )
+    assert (
+        classify_access_kind(
+            ["SEARCH orders USING INDEX idx_status", "SCAN customers"]
+        )
+        == "FULL_SCAN"
+    )
+    assert (
+        classify_access_kind(
+            [
+                "SEARCH a USING COVERING INDEX idx_a",
+                "SEARCH b USING INDEX idx_b",
+            ]
+        )
+        == "INDEX_SEARCH"
+    )
+
+
 def test_diff_detects_index_to_scan_regression_and_missing_queries() -> None:
     baseline = [
         PlanSnapshot(
@@ -96,7 +121,7 @@ def test_diff_flags_new_temp_btree_when_strict_mode_enabled() -> None:
             name="sorted_events",
             sql="SELECT id FROM events ORDER BY created_at",
             steps=["SCAN events USING COVERING INDEX idx_events_created"],
-            access_kind="INDEX_SEARCH",
+            access_kind="COVERING_INDEX",
             uses_temp_btree=False,
         )
     ]
@@ -104,8 +129,8 @@ def test_diff_flags_new_temp_btree_when_strict_mode_enabled() -> None:
         PlanSnapshot(
             name="sorted_events",
             sql="SELECT id FROM events ORDER BY created_at",
-            steps=["SEARCH events USING INDEX idx_other", "USE TEMP B-TREE FOR ORDER BY"],
-            access_kind="INDEX_SEARCH",
+            steps=["SCAN events USING COVERING INDEX idx_events_created", "USE TEMP B-TREE FOR ORDER BY"],
+            access_kind="COVERING_INDEX",
             uses_temp_btree=True,
         )
     ]
@@ -142,7 +167,7 @@ def test_diff_flags_covering_index_downgrade_to_table_lookup() -> None:
     assert report.regressions[0].current_kind == "INDEX_SEARCH"
 
 
-def test_capture_rejects_blank_name_and_empty_sql(tmp_path: Path) -> None:
+def test_capture_rejects_blank_duplicate_and_missing_db(tmp_path: Path) -> None:
     db_file = tmp_path / "empty.db"
     _create_sample_db(db_file, with_index=False)
 
@@ -150,12 +175,55 @@ def test_capture_rejects_blank_name_and_empty_sql(tmp_path: Path) -> None:
         capture_snapshots(db_file, [QuerySpec(name="   ", sql="SELECT 1", params=[])])
     with pytest.raises(ValueError, match="non-empty SQL"):
         capture_snapshots(db_file, [QuerySpec(name="bad_sql", sql="EXPLAIN QUERY PLAN ;", params=[])])
+    with pytest.raises(ValueError, match="Duplicate QuerySpec name"):
+        capture_snapshots(
+            db_file,
+            [
+                QuerySpec(name="dup", sql="SELECT 1", params=[]),
+                QuerySpec(name="dup", sql="SELECT 2", params=[]),
+            ],
+        )
+
+    missing_db = tmp_path / "does_not_exist.db"
+    with pytest.raises(FileNotFoundError):
+        capture_snapshots(missing_db, [QuerySpec(name="q", sql="SELECT 1", params=[])])
+    assert not missing_db.exists()
 
 
-def test_cli_capture_and_check_exit_codes(
+def test_parse_annotated_sql_queries_and_validation(tmp_path: Path) -> None:
+    sql_file = tmp_path / "queries.sql"
+    sql_file.write_text(
+        """
+        -- Leading doc comment ignored
+        -- name: lookup_mark
+        -- params: ["CM2102", 65]
+        SELECT student_id
+        FROM enrolments
+        WHERE module_code = ? AND mark >= ?;
+
+        -- name: count_rows
+        SELECT COUNT(*) FROM enrolments;
+        """,
+        encoding="utf-8",
+    )
+
+    specs = load_query_specs(sql_file)
+    assert len(specs) == 2
+    assert specs[0].name == "lookup_mark"
+    assert specs[0].params == ["CM2102", 65]
+    assert specs[1].name == "count_rows"
+    assert specs[1].params == []
+
+    with pytest.raises(ValueError, match="Duplicate query name"):
+        parse_sql_queries("-- name: a\nSELECT 1;\n-- name: a\nSELECT 2;")
+    with pytest.raises(ValueError, match="JSON array"):
+        parse_sql_queries('-- name: a\n-- params: {"k": 1}\nSELECT 1;')
+
+
+def test_cli_capture_explain_and_check_text_and_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    queries_json = tmp_path / "queries.json"
+    queries_sql = tmp_path / "queries.sql"
     baseline_json = tmp_path / "baseline.json"
     schema_good = tmp_path / "good.sql"
     schema_bad = tmp_path / "bad.sql"
@@ -169,19 +237,46 @@ def test_cli_capture_and_check_exit_codes(
         "CREATE TABLE students(id INTEGER PRIMARY KEY, email TEXT);",
         encoding="utf-8",
     )
-    queries_json.write_text(
-        json.dumps([{"name": "find_by_email", "sql": "SELECT id FROM students WHERE email = ?", "params": ["a@b.c"]}]),
+    queries_sql.write_text(
+        '-- name: find_by_email\n-- params: ["a@b.c"]\nSELECT id FROM students WHERE email = ?;\n',
         encoding="utf-8",
     )
 
-    assert main(["capture", ":memory:", str(queries_json), "--schema", str(schema_good), "-o", str(baseline_json)]) == 0
+    assert main(["explain", ":memory:", str(queries_sql), "--schema", str(schema_good)]) == 0
+    explain_out = capsys.readouterr().out
+    assert "find_by_email |" in explain_out
+
+    assert main(["capture", ":memory:", str(queries_sql), "--schema", str(schema_good), "-o", str(baseline_json)]) == 0
     capsys.readouterr()
 
-    assert main(["check", ":memory:", str(queries_json), "--schema", str(schema_good), "--baseline", str(baseline_json)]) == 0
+    assert main(["check", ":memory:", str(queries_sql), "--schema", str(schema_good), "--baseline", str(baseline_json)]) == 0
     ok_payload = json.loads(capsys.readouterr().out)
     assert ok_payload["passed"] is True
 
-    assert main(["check", ":memory:", str(queries_json), "--schema", str(schema_bad), "--baseline", str(baseline_json)]) == 1
-    fail_payload = json.loads(capsys.readouterr().out)
-    assert fail_payload["passed"] is False
-    assert fail_payload["regressions"][0]["severity"] == "REGRESSION"
+    assert (
+        main(
+            [
+                "check",
+                ":memory:",
+                str(queries_sql),
+                "--schema",
+                str(schema_bad),
+                "--baseline",
+                str(baseline_json),
+                "--format",
+                "text",
+            ]
+        )
+        == 1
+    )
+    fail_text = capsys.readouterr().out
+    assert "FAILED" in fail_text
+    assert "find_by_email" in fail_text
+
+
+def test_cli_returns_exit_code_2_on_missing_input_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing_queries = tmp_path / "missing.json"
+    assert main(["explain", ":memory:", str(missing_queries)]) == 2
+    assert "error:" in capsys.readouterr().err

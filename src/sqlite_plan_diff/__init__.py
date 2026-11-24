@@ -5,7 +5,12 @@ from sqlite_plan_diff.checker import (
     QuerySpec,
     capture_plan,
     capture_snapshots,
+    classify_access_kind,
     diff_snapshots,
+    load_baseline,
+    load_query_specs,
+    parse_sql_queries,
+    save_baseline,
 )
 
 __all__ = [
@@ -15,5 +20,10 @@ __all__ = [
     "QuerySpec",
     "capture_plan",
     "capture_snapshots",
+    "classify_access_kind",
     "diff_snapshots",
+    "load_baseline",
+    "load_query_specs",
+    "parse_sql_queries",
+    "save_baseline",
 ]
